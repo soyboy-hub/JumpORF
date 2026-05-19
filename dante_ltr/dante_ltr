@@ -1,0 +1,1119 @@
+#!/usr/bin/env python
+"""This wrapper is intended to be used on large genomes and large DANTE input to
+minimize memory usage, It splits input files to pieces and analyze it on by one by
+detect_putative_ltr.R
+If input does not exceed specified max-chunk_size, it will run detect_putative_ltr.R
+directly
+"""
+
+import argparse
+import os
+import shutil
+import sys
+import tempfile
+from itertools import cycle
+import subprocess
+from version import __version__
+
+class Gff3Feature:
+    """
+    Class for gff3 feature
+    """
+
+    def __init__(self, line):
+        self.line = line
+        self.items = line.strip().split('\t')
+        self.header = self.items[0]
+        self.source = self.items[1]
+        self.type = self.items[2]
+        self.start = int(self.items[3])
+        self.end = int(self.items[4])
+        self.score = self.items[5]
+        self.strand = self.items[6]
+        self.frame = self.items[7]
+        self.attributes = self.items[8]
+        self.attributes_dict = {}
+        for item in self.attributes.split(';'):
+            if item != '':
+                key, value = item.split('=')
+                self.attributes_dict[key] = value
+
+        self.attributes_str = ';'.join(
+            ['{}={}'.format(key, value) for key, value in self.attributes_dict.items()]
+            )
+
+    def __str__(self):
+        return '\t'.join(
+            [self.header, self.source, self.type, str(self.start), str(self.end),
+             self.score, self.strand, self.frame, self.attributes_str]
+            ) + '\n'
+
+    def __repr__(self):
+        return '\t'.join(
+            [self.header, self.source, self.type, str(self.start), str(self.end),
+             self.score, self.strand, self.frame, self.attributes_str]
+            ) + '\n'
+
+    def __eq__(self, other):
+        return self.line_recalculated() == other.line_recalculated()
+
+    def __hash__(self):
+        return hash(self.line_recalculated())
+
+    def get_line(self):
+        """returns original line"""
+        return self.line
+
+    def overlap(self, other):
+        """
+        Check if two features overlap
+        :param other:
+        :return:
+        """
+        if self.start <= other.end and self.end >= other.start:
+            return True
+        else:
+            return False
+
+    def line_recalculated(self):
+        """
+        :return:
+        string with recalculated line
+        """
+        return '\t'.join(
+            [self.header, self.source, self.type, str(self.start), str(self.end),
+             self.score, self.strand, self.frame, self.attributes_str]
+            ) + '\n'
+
+    def __lt__(self, other):
+        width = self.end - self.start
+        other_width = other.end - other.start
+        return width < other_width
+
+    def __gt__(self, other):
+        width = self.end - self.start
+        other_width = other.end - other.start
+        return width > other_width
+
+    def identical_region(self, other):
+        """
+        Check if two features are identical
+        :param other:
+        :return:
+        """
+        if self.start == other.start and self.end == other.end and self.header == \
+                other.header:
+            return True
+        else:
+            return False
+
+
+def get_arguments():
+    """
+    Get arguments from command line
+    :return:
+    args
+    """
+    parser = argparse.ArgumentParser(
+        description="""
+        Tool for identifying complete LTR retrotransposons based on 
+        analysis of protein domains identified with the DANTE tool
+        """,
+            formatter_class=argparse.RawTextHelpFormatter
+        )
+    parser.add_argument(
+        '-g', '--gff3', default=None, required=True,
+        help=("gff3 file with full output from Domain Based Annotation of Transposable "
+             "Elements (DANTE)"),
+
+        type=str,
+        action='store'
+        )
+    parser.add_argument(
+        '-s', '--reference_sequence', default=None, required=True,
+        help="reference sequence as fasta file", type=str, action='store'
+        )
+    parser.add_argument(
+        '-o', '--output', default=None, required=True, help="output file path and prefix",
+        type=str, action='store'
+        )
+    parser.add_argument(
+        '-c', '--cpu', default=1, required=False, help="number of CPUs", type=int,
+        action='store'
+        )
+    parser.add_argument(
+        '-M', '--max_missing_domains', default=0, required=False, type=int
+        )
+    parser.add_argument(
+        '-L', '--min_relative_length', default=0.6, required=False, type=float,
+        help="Minimum relative length of protein domain to be "
+             "considered for retrostransposon detection"
+        )
+    parser.add_argument(
+        '-S', '--max_chunk_size', default=100000000, required=False, type=int,
+        help="""
+        If size of reference sequence is greater than this value, reference is '
+        'analyzed in chunks of this size. default is %(default)s '
+        'Setting this value too small  will slow down the analysis
+        """
+        )
+    parser.add_argument(
+        '-v', '--version', action='version', version='%(prog)s ' + __version__
+        )
+    parser.add_argument('--te_constrains', default=None, required=False,
+                         type=str,
+                         help='csv table specifying TE constraints for LTR search, '
+                              'template for this table \n'
+                              'can be found in '
+                              'https://github.com/kavonrtep/dante_ltr/blob/main/databases/lineage_domain_order.csv'
+                        )
+    parser.add_argument('--fallback_mode', default='none', required=False,
+                        choices=['none', 'coarse3', 'coarse2'],
+                        help='Classify at reduced taxonomic depth and demote '
+                             "DANTE's lineage-level calls accordingly. Useful on "
+                             'species poorly covered by REXdb.\n'
+                             '  none     default; current behaviour\n'
+                             '  coarse3  classify into copia / gypsy-chromovirus / '
+                                         'gypsy-non-chromovirus\n'
+                             '  coarse2  classify into copia / gypsy only\n'
+                             'See docs/fallback_classification_spec.md.'
+                        )
+    # no_ambiguous_domains option:
+    parser.add_argument('--no_ambiguous_domains', default=False, required=False,
+                         action='store_true',
+                         help='Remove ambiguous domains from analysis'
+                        )
+
+
+    args = parser.parse_args()
+    return args
+
+def read_fasta_sequence_size(fasta_file):
+    """Read size of sequence into dictionary"""
+    fasta_dict = {}
+    with open(fasta_file, 'r') as f:
+        for line in f:
+            if line[0] == '>':
+                header = line.strip().split(' ')[0][1:]  # remove part of name after space
+                fasta_dict[header] = 0
+            else:
+                fasta_dict[header] += len(line.strip())
+    return fasta_dict
+
+
+def make_temp_files(number_of_files):
+    """
+    Make named temporary files, file will not be deleted upon exit!
+    :param number_of_files:
+    :return:
+    filepaths
+    """
+    temp_files = []
+    for i in range(number_of_files):
+        temp_files.append(tempfile.NamedTemporaryFile(delete=False).name)
+        os.remove(temp_files[-1])
+    return temp_files
+
+
+def sum_up_stats_files(files):
+    """
+    Sum up statistics files
+    :return:
+    """
+    new_statistics = {}
+    for file in files:
+        with open(file, 'r') as fh:
+            for line in fh:
+                items = line.strip().split('\t')
+                if items[0] == 'Classification':
+                    header = items
+                    continue
+                else:
+                    counts = [int(item) for item in items[1:]]
+                    if items[0] in new_statistics:
+                        new_statistics[items[0]] = [sum(x) for x in
+                                                    zip(new_statistics[items[0]], counts)]
+                    else:
+                        new_statistics[items[0]] = counts
+    # convert to string, first line is header
+    statistics_str = []
+    for classification, counts in new_statistics.items():
+        statistics_str.append(classification + '\t' + '\t'.join([str(x) for x in counts]))
+    sorted_stat_with_header = ['\t'.join(header)] + sorted(statistics_str)
+    return sorted_stat_with_header
+
+
+def read_single_fasta_to_dictionary(fh):
+    """
+    Read fasta file into dictionary
+    :param fh:
+    :return:
+    fasta_dict
+    """
+    fasta_dict = {}
+    for line in fh:
+        if line[0] == '>':
+            header = line.strip().split(' ')[0][1:]  # remove part of name after space
+            fasta_dict[header] = []
+        else:
+            fasta_dict[header] += [line.strip()]
+    fasta_dict = {k: ''.join(v) for k, v in fasta_dict.items()}
+    return fasta_dict
+
+
+def split_fasta_to_chunks(fasta_file, chunk_size=100000000, overlap=100000):
+    """
+    Split fasta file to chunks, sequences longe than chuck size are split to overlaping
+    peaces. If sequences are shorter, chunck with multiple sequences are created.
+    :param fasta_file:
+
+    :param fasta_file:
+    :param chunk_size:
+    :param overlap:
+    :return:
+    fasta_file_split
+    matching_table
+    """
+    min_chunk_size = chunk_size * 2
+    fasta_dict = read_fasta_sequence_size(fasta_file)
+    # calculates ranges for splitting of fasta files and store them in list
+    matching_table = []
+    fasta_file_split = tempfile.NamedTemporaryFile(delete=False).name
+    for header, size in fasta_dict.items():
+        if size > min_chunk_size:
+            number_of_chunks = int(size / chunk_size)
+            adjusted_chunk_size = int(size / number_of_chunks)
+            for i in range(number_of_chunks):
+                start = i * adjusted_chunk_size
+                end = ((i + 1) *
+                       adjusted_chunk_size
+                       + overlap) if i + 1 < number_of_chunks else size
+                new_header = header + '_' + str(i)
+                matching_table.append([header, i, start, end, new_header])
+        else:
+            new_header = header + '_0'
+            matching_table.append([header, 0, 0, size, new_header])
+    # read sequences from fasta files and split them to chunks according to matching table
+    # open output and input files, use with statement to close files
+    fasta_dict = read_single_fasta_to_dictionary(open(fasta_file, 'r'))
+    with open(fasta_file_split, 'w') as fh_out:
+        for header in fasta_dict:
+            matching_table_part = [x for x in matching_table if x[0] == header]
+            for header2, i, start, end, new_header in matching_table_part:
+                fh_out.write('>' + new_header + '\n')
+                fh_out.write(fasta_dict[header][start:end] + '\n')
+    return fasta_file_split, matching_table
+
+
+def get_new_header_and_coordinates(header, start, end, matching_table):
+    """
+    Get new header and coordinates for sequence
+    :param header:
+    :param start:
+    :param end:
+    :param matching_table:
+    :return:
+    new_header
+    new_start
+    new_end
+    """
+    matching_table_part = [x for x in matching_table if x[0] == header]
+    new_coords = []
+    for chunk in matching_table_part:
+        if chunk[2] <= start < chunk[3]:
+            new_header = chunk[4]
+            new_start = start - chunk[2]
+            new_end = end - chunk[2]
+            new_sequence_length = chunk[3] - chunk[2]
+            new_coords.append([new_header, new_start, new_end, new_sequence_length])
+    return new_coords
+
+
+def get_original_header_and_coordinates(new_header, new_start, new_end, matching_table):
+    """
+    Get original header and coordinates for sequence
+    :param new_header:
+    :param new_start:
+    :param new_end:
+    :param matching_table:
+    :return:
+    original_header
+    original_start
+    original_end
+    """
+    matching_table_part = [x for x in matching_table if x[4] == new_header]
+    ori_header = matching_table_part[0][0]
+    start = matching_table_part[0][2]
+    ori_start = new_start + start
+    ori_end = new_end + start
+    return ori_header, ori_start, ori_end
+
+
+# recalculate gff3 coordinates, use gff3_feature class
+def recalculate_gff3_coordinates(gff3_file, matching_table):
+    """
+    Recalculate gff3 coordinates, use gff3_feature class
+    :param gff3_file:
+    :param matching_table:
+    :return:
+    gff3_file_recalculated
+    """
+    gff3_file_recalculated = tempfile.NamedTemporaryFile(delete=False).name
+
+    with open(gff3_file, 'r') as fh_in:
+        with open(gff3_file_recalculated, 'w') as fh_out:
+            for line in fh_in:
+                if line[0] == '#':
+                    fh_out.write(line)
+                else:
+                    feature = Gff3Feature(line)
+                    new_coords = get_new_header_and_coordinates(
+                        feature.header, feature.start, feature.end, matching_table
+                        )
+                    for new_header, new_start, new_end, sequence_length in new_coords:
+                        if new_start >= 1 and new_end <= sequence_length:
+                            feature.header = new_header
+                            feature.start = new_start
+                            feature.end = new_end
+                            fh_out.write(str(feature))
+    return gff3_file_recalculated
+
+
+# recalculate gff3 back to original coordinates, use gff3_feature class
+def recalculate_gff3_back_to_original_coordinates(gff3_file, matching_table):
+    """
+    Recalculate gff3 back to original coordinates, use gff3_feature class
+    :param gff3_file:
+    :param matching_table:
+    :return:
+    gff3_file_recalculated
+    """
+    gff3_file_recalculated = tempfile.NamedTemporaryFile(delete=False).name
+    with open(gff3_file, 'r') as fh_in:
+        with open(gff3_file_recalculated, 'w') as fh_out:
+            for line in fh_in:
+                if line[0] == '#':
+                    fh_out.write(line)
+                else:
+                    feature = Gff3Feature(line)
+                    ori_header, ori_start, ori_end = get_original_header_and_coordinates(
+                        feature.header, feature.start, feature.end, matching_table
+                        )
+                    feature.header = ori_header
+                    feature.start = ori_start
+                    feature.end = ori_end
+                    fh_out.write(str(feature))
+    return gff3_file_recalculated
+
+
+def get_feature_attributes(line):
+    """
+    Get attributes as dictionary from gff3 list
+    :param line:
+    :return:
+    attributes_dict
+    """
+    attributes_dict = {}
+    for item in line[8].split(';'):
+        if item.strip():
+            key, value = item.strip().split('=')
+            attributes_dict[key] = value
+    return attributes_dict
+
+
+def get_unique_features(gff3_file):
+    """
+    return list of ID of non-ovelaping features.
+
+    :param gff3_file:
+    :return:
+    duplicated_features
+    """
+    good_id = []
+    feature_list = []
+    with open(gff3_file, 'r') as fh:
+        for line in fh:
+            if line[0] == '#':
+                continue
+            feature = Gff3Feature(line)
+            if feature.type != 'transposable_element':
+                continue
+            feature_list.append(feature)  # sort by start position and header
+    feature_list.sort(key=lambda x: (x.start, x.header))
+    i = 0
+    while i < len(feature_list) - 1:
+        ch = feature_list[i].header == feature_list[i + 1].header
+        if not ch:
+            good_id.append(feature_list[i].attributes_dict['ID'])
+            i += 1
+            continue
+        if feature_list[i].identical_region(feature_list[i + 1]):
+            # identical position
+            good_id.append(feature_list[i].attributes_dict['ID'])
+            i += 2
+            continue
+        if feature_list[i].overlap(feature_list[i + 1]):
+            # overlap
+            if feature_list[i] > feature_list[i + 1]:
+                good_id.append(feature_list[i].attributes_dict['ID'])
+                i += 2
+                continue
+            else:
+                good_id.append(feature_list[i + 1].attributes_dict['ID'])
+                i += 2
+                continue
+        else:
+            good_id.append(feature_list[i].attributes_dict['ID'])
+            i += 1
+    if i == len(feature_list) - 1:
+        good_id.append(feature_list[i].attributes_dict['ID'])
+    return good_id
+
+
+def filter_gff3_file(gff3_file, good_id, output_file):
+    """
+    Filter gff3 file by good_id
+    :param gff3_file:
+    :param good_id:
+    :param output_file:
+    :return:
+    filtered_gff3_file
+    """
+
+    with open(gff3_file, 'r') as fh, open(output_file, 'w') as fout:
+        for line in fh:
+            if line[0] == '#':
+                fout.write(line)
+            else:
+                feature = Gff3Feature(line)
+                if ('ID' in feature.attributes_dict and
+                        feature.attributes_dict['ID'] in good_id):
+                    fout.write(line)
+                    continue
+                if 'Parent' in feature.attributes_dict:
+                    if feature.attributes_dict['Parent'] in good_id:
+                        fout.write(line)
+                        continue
+def verify_seqnames(gff3, fasta):
+    """
+    Verify that ate least some seqnames in gff3 file are in fasta file
+    :param gff3:
+    :param fasta:
+    :return: True/False
+    """
+    gff_seqnames = set()
+    fasta_seqnames = set()
+    with open(gff3, 'r') as fh:
+        for line in fh:
+            if line[0] == '#':
+                continue
+            gff_seqnames.add(line.split('\t')[0])
+    with open(fasta, 'r') as fh:
+        for line in fh:
+            if line[0] == '>':
+                # seqname in fasta could contain additional description after space
+                fasta_seqnames.add(line[1:].split()[0])
+    if gff_seqnames.intersection(fasta_seqnames):
+        return True
+    else:
+        return False
+
+def add_version_to_gff3(gff3_file, version_info):
+    """
+    Add version to gff3 file
+    :param gff3_file:
+    :param version_info:
+    :return:
+    """
+    tmp_filename = os.path.join(gff3_file + '.tmp')
+    with open(gff3_file, 'r') as src_file, open(tmp_filename, 'w') as tmp_file:
+        line = src_file.readline()
+        tmp_file.write(line)
+        tmp_file.write("##DANTE_LTR version " + version_info + '\n')
+        shutil.copyfileobj(src_file, tmp_file)
+        # Replace the original file with the new file
+    os.replace(tmp_file.name, gff3_file)
+
+def ltr_resolution_stats(gff3_file, min_relative_length=0.6):
+    """
+    Scan a DANTE GFF3 and count LTR protein_domain features by
+    resolution depth, using the branch-aware semantics of the
+    REXdb hierarchy:
+      copia lineages live at depth >= 4 (Class_I|LTR|Ty1/copia|<lineage>)
+      gypsy lineages live at depth >= 5
+                         (Class_I|LTR|Ty3/gypsy|<sub>|<lineage>)
+
+    Only counts features that pass the Relat_Length filter
+    (>= min_relative_length), matching dante_filtering() in
+    detect_putative_ltr.R. Non-LTR features are ignored.
+
+    Returns a dict with keys:
+        n_counted         — filtered LTR protein_domains
+        n_superfam_only   — just Class_I|LTR|Ty1/copia or Ty3/gypsy (depth 3)
+        n_unresolved      — below lineage depth (includes superfam_only +
+                            Ty3/gypsy at depth 4 without lineage part)
+        f_superfam_only   — share of n_superfam_only
+        f_unresolved      — share of n_unresolved
+    """
+    n_total = 0
+    n_superfam_only = 0
+    n_unresolved = 0
+    with open(gff3_file) as fh:
+        for line in fh:
+            if not line or line[0] == '#':
+                continue
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 9 or parts[2] != 'protein_domain':
+                continue
+            attrs = {}
+            for item in parts[8].split(';'):
+                if '=' in item:
+                    k, _, v = item.partition('=')
+                    attrs[k] = v
+            cls = attrs.get('Final_Classification', '')
+            if not cls.startswith('Class_I|LTR|'):
+                continue
+            rl = attrs.get('Relat_Length', '')
+            try:
+                if float(rl) < min_relative_length:
+                    continue
+            except ValueError:
+                continue
+            n_total += 1
+            components = cls.split('|')
+            depth = len(components)
+            # components[2] is Ty1/copia or Ty3/gypsy (or unknown)
+            third = components[2] if depth >= 3 else ''
+            if depth == 3:
+                n_superfam_only += 1
+                n_unresolved += 1
+            elif third == 'Ty3/gypsy' and depth == 4:
+                # gypsy with only sub-family (chromovirus / non-chromovirus)
+                # but no lineage — still unresolved
+                n_unresolved += 1
+            elif depth < 3:
+                # Class_I or Class_I|LTR without any superfamily
+                n_unresolved += 1
+    if n_total == 0:
+        return {
+            'n_counted': 0, 'n_superfam_only': 0, 'n_unresolved': 0,
+            'f_superfam_only': 0.0, 'f_unresolved': 0.0,
+        }
+    return {
+        'n_counted': n_total,
+        'n_superfam_only': n_superfam_only,
+        'n_unresolved': n_unresolved,
+        'f_superfam_only': n_superfam_only / n_total,
+        'f_unresolved': n_unresolved / n_total,
+    }
+
+
+def demote_classification(cls, mode):
+    """
+    Return (new_classification, was_demoted) under the given fallback
+    mode for one Final_Classification string.
+
+    Demotion is branch-aware:
+      copia branch (Class_I|LTR|Ty1/copia|<lineage>) — always truncate
+            to the Ty1/copia superfamily.
+      gypsy branch (Class_I|LTR|Ty3/gypsy|...) — under coarse2 truncate
+            to the Ty3/gypsy superfamily; under coarse3 truncate
+            sublineages into their chromovirus / non-chromovirus
+            subfamily (or leave level-3-only gypsy alone — there's no
+            catch-all row for it).
+
+    Non-LTR classifications and classifications already at or above
+    the target depth pass through unchanged (was_demoted=False).
+    """
+    if mode == 'none' or not cls or not cls.startswith('Class_I|LTR|'):
+        return cls, False
+    parts = cls.split('|')
+    # parts: [Class_I, LTR, <superfamily>, ...]
+    if len(parts) < 3:
+        return cls, False
+    superfamily = parts[2]
+    if superfamily == 'Ty1/copia':
+        target = 'Class_I|LTR|Ty1/copia'  # same under coarse3 and coarse2
+    elif superfamily == 'Ty3/gypsy':
+        if mode == 'coarse2':
+            target = 'Class_I|LTR|Ty3/gypsy'
+        else:  # coarse3
+            if len(parts) >= 4 and parts[3] in ('chromovirus',
+                                                'non-chromovirus'):
+                target = '|'.join(parts[:4])
+            else:
+                # Level-3 gypsy with no sub — no row in coarse3 table,
+                # leave as-is so the user can notice and switch mode.
+                return cls, False
+    else:
+        # Unknown third component: leave alone
+        return cls, False
+    if cls == target:
+        return cls, False
+    return target, True
+
+
+def preprocess_gff3_for_fallback(in_path, out_path, mode):
+    """
+    Read in_path (DANTE GFF3), rewrite Final_Classification values
+    according to the fallback `mode`, add Original_Classification when
+    the classification was actually demoted, write to out_path.
+
+    Returns (n_features, n_demoted_features).
+    """
+    n_features = 0
+    n_demoted = 0
+    with open(in_path) as fin, open(out_path, 'w') as fout:
+        for line in fin:
+            if not line or line[0] == '#':
+                fout.write(line)
+                continue
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 9:
+                fout.write(line)
+                continue
+            n_features += 1
+            attrs_str = parts[8]
+            # Fast path: no LTR classification => no change
+            if 'Final_Classification=Class_I|LTR|' not in attrs_str:
+                fout.write(line)
+                continue
+            # Split attributes; preserve order
+            attrs = []
+            fc_value = None
+            for item in attrs_str.split(';'):
+                if not item:
+                    continue
+                k, _, v = item.partition('=')
+                attrs.append((k, v))
+                if k == 'Final_Classification':
+                    fc_value = v
+            new_fc, demoted = demote_classification(fc_value, mode)
+            if not demoted:
+                fout.write(line)
+                continue
+            n_demoted += 1
+            # Rebuild attribute string with Original_Classification inserted
+            # immediately after Final_Classification for readability.
+            rebuilt = []
+            for k, v in attrs:
+                if k == 'Final_Classification':
+                    rebuilt.append(('Final_Classification', new_fc))
+                    rebuilt.append(('Original_Classification', fc_value))
+                else:
+                    rebuilt.append((k, v))
+            new_attrs = ';'.join('{}={}'.format(k, v) for k, v in rebuilt)
+            parts[8] = new_attrs
+            fout.write('\t'.join(parts) + '\n')
+    return n_features, n_demoted
+
+
+def _iter_gff3_records(path):
+    """Yield (parts, attrs_dict) tuples for feature lines of a GFF3."""
+    with open(path) as fh:
+        for line in fh:
+            if not line or line[0] == '#':
+                continue
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) < 9:
+                continue
+            attrs = {}
+            for item in parts[8].split(';'):
+                if '=' in item:
+                    k, _, v = item.partition('=')
+                    attrs[k] = v
+            yield parts, attrs
+
+
+def nonchromo_arh_fraction(demoted_gff3, domain_span_bp,
+                           min_relative_length=0.6,
+                           target_classification='Class_I|LTR|Ty3/gypsy|non-chromovirus'):
+    """
+    Fraction of spatially-clustered non-chromovirus LTR groups that
+    contain at least one aRH domain. Clusters are: same contig, same
+    strand, feature starts within `domain_span_bp` of each other.
+
+    Returns (fraction, n_clusters, n_clusters_with_arh).
+    """
+    # Collect (contig, strand, start, name) for filtered non-chromo domains
+    items = []
+    for parts, attrs in _iter_gff3_records(demoted_gff3):
+        if parts[2] != 'protein_domain':
+            continue
+        cls = attrs.get('Final_Classification', '')
+        if cls != target_classification:
+            continue
+        try:
+            if float(attrs.get('Relat_Length', '0')) < min_relative_length:
+                continue
+        except ValueError:
+            continue
+        items.append((parts[0], parts[6], int(parts[3]), attrs.get('Name', '')))
+
+    if not items:
+        return 0.0, 0, 0
+
+    # Cluster by contig + strand, then by proximity
+    items.sort(key=lambda r: (r[0], r[1], r[2]))
+    clusters = []        # list of lists of names per cluster
+    cur_names = []
+    prev_key = None
+    prev_start = None
+    for contig, strand, start, name in items:
+        key = (contig, strand)
+        if (prev_key is None or key != prev_key
+                or start - prev_start > domain_span_bp):
+            if cur_names:
+                clusters.append(cur_names)
+            cur_names = []
+        cur_names.append(name)
+        prev_key = key
+        prev_start = start
+    if cur_names:
+        clusters.append(cur_names)
+
+    n_clusters = len(clusters)
+    n_with_arh = sum(1 for names in clusters if 'aRH' in names)
+    return (n_with_arh / n_clusters if n_clusters else 0.0,
+            n_clusters, n_with_arh)
+
+
+def maybe_insert_arh_in_constraints(in_csv, out_csv,
+                                    target_lineage_prefix='Class_I/LTR/Ty3_gypsy/non-chromovirus'):
+    """
+    Read `in_csv` (the loose constraints table), look for a row whose
+    Lineage is exactly `target_lineage_prefix`, and rewrite its
+    'Domains order' field to include aRH between RH and INT.  Write
+    the result to `out_csv`.  If no matching row is found, just copies
+    the file.  Returns True when the Domains order was actually
+    changed.
+
+    Assumes the shipped non-chromovirus order is 'GAG PROT RT RH INT'
+    (as in databases/lineage_domain_order_coarse3.csv).
+    """
+    changed = False
+    with open(in_csv) as fin, open(out_csv, 'w') as fout:
+        header = fin.readline().rstrip('\n')
+        fout.write(header + '\n')
+        cols = header.split('\t')
+        try:
+            i_lin = cols.index('Lineage')
+            i_dom = cols.index('Domains order')
+        except ValueError:
+            # Unexpected schema — copy rest verbatim
+            for line in fin:
+                fout.write(line)
+            return False
+        for line in fin:
+            row = line.rstrip('\n').split('\t')
+            if len(row) == len(cols) and row[i_lin] == target_lineage_prefix:
+                if 'aRH' not in row[i_dom].split():
+                    # Insert aRH between RH and INT (spec §6.2)
+                    tokens = row[i_dom].split()
+                    try:
+                        idx_rh = tokens.index('RH')
+                    except ValueError:
+                        idx_rh = -1
+                    if idx_rh >= 0 and tokens[idx_rh + 1:idx_rh + 2] == ['INT']:
+                        tokens.insert(idx_rh + 1, 'aRH')
+                        row[i_dom] = ' '.join(tokens)
+                        changed = True
+            fout.write('\t'.join(row) + '\n')
+    return changed
+
+
+def emit_fallback_recommendation(stats, fallback_mode):
+    """
+    Print a short resolution report and, when --fallback_mode=none and
+    the input looks distant, a recommendation.
+
+    Thresholds per docs/fallback_classification_spec.md §3.
+    """
+    n = stats['n_counted']
+    if n == 0:
+        return
+    fs = stats['f_superfam_only']
+    fu = stats['f_unresolved']
+    print(
+        "LTR-domain resolution: superfamily-only={:.0%}, "
+        "not-reaching-lineage={:.0%} (of {} filtered LTR "
+        "protein_domain features)".format(fs, fu, n)
+    )
+    if fallback_mode != 'none':
+        return
+    if fs > 0.5:
+        print(
+            "INFO: {:.0%} of LTR protein domains are only classified at "
+            "Ty1/copia or Ty3/gypsy depth.  Consider re-running with "
+            "--fallback_mode=coarse2 (see "
+            "docs/fallback_classification_spec.md).".format(fs)
+        )
+    elif fu > 0.2:
+        print(
+            "INFO: {:.0%} of LTR protein domains do not reach lineage "
+            "depth.  Consider re-running with --fallback_mode=coarse3 "
+            "(see docs/fallback_classification_spec.md).".format(fu)
+        )
+
+
+def main():
+    """
+    Main function
+    """
+    args = get_arguments()
+    # locate directory of current script
+    tool_path = os.path.dirname(os.path.realpath(__file__))
+    # verify that at least some seqnames in gff3 match seqnames in reference fasta file.
+    # If not, exit
+    if not verify_seqnames(args.gff3, args.reference_sequence):
+        # print error message to stderr
+        sys.stderr.write(
+            'ERROR: No seqnames in gff3 file match seqnames in reference fasta file. '
+            'Please check that gff3 file was created from reference fasta file.\n'
+            )
+        sys.exit(1)
+
+    # Observation-only: scan classifications and log recommendation
+    stats = ltr_resolution_stats(
+        args.gff3, min_relative_length=args.min_relative_length
+    )
+    emit_fallback_recommendation(stats, args.fallback_mode)
+
+    # Fallback mode: demote LTR classifications in the input GFF3 and
+    # (unless --te_constrains is set) use the matching loose constraints
+    # table.  Everything downstream sees the demoted file.
+    gff3_input = args.gff3
+    constrains_path = args.te_constrains
+    if args.fallback_mode != 'none':
+        fb_dir = os.path.join(os.path.dirname(os.path.abspath(args.output)),
+                              '_fallback_inputs')
+        os.makedirs(fb_dir, exist_ok=True)
+        demoted_gff3 = os.path.join(
+            fb_dir, 'dante_demoted_' + args.fallback_mode + '.gff3'
+        )
+        n_feat, n_demoted = preprocess_gff3_for_fallback(
+            args.gff3, demoted_gff3, args.fallback_mode
+        )
+        print(
+            'fallback_mode={}: demoted {} / {} features; '
+            'demoted GFF3 -> {}'.format(
+                args.fallback_mode, n_demoted, n_feat, demoted_gff3
+            )
+        )
+        gff3_input = demoted_gff3
+        if constrains_path is None:
+            constrains_path = os.path.join(
+                tool_path, 'databases',
+                'lineage_domain_order_' + args.fallback_mode + '.csv'
+            )
+            print('using built-in constraints table: ' + constrains_path)
+        else:
+            print('using user-supplied --te_constrains: ' + constrains_path)
+
+        # Data-driven aRH inclusion: if aRH appears in >=20% of spatially
+        # clustered non-chromovirus LTR groups, rewrite that row's
+        # Domains order to include aRH.  Only applies to coarse3.
+        ARH_FRACTION_THRESHOLD = 0.20
+        if (args.fallback_mode == 'coarse3'
+                and args.te_constrains is None):
+            # domain_span used as clustering gap — take from constraints row
+            domain_span = 9000  # fallback default; gets overwritten below
+            try:
+                import csv as _csv
+                with open(constrains_path) as _fh:
+                    rdr = _csv.DictReader(_fh, delimiter='\t')
+                    for row in rdr:
+                        if row['Lineage'] == 'Class_I/LTR/Ty3_gypsy/non-chromovirus':
+                            domain_span = int(row['domain_span'])
+                            break
+            except (IOError, KeyError, ValueError):
+                pass
+            frac, n_cl, n_cl_arh = nonchromo_arh_fraction(
+                demoted_gff3, domain_span,
+                min_relative_length=args.min_relative_length
+            )
+            print(
+                'aRH check: found in {}/{} non-chromovirus clusters '
+                '({:.0%})'.format(n_cl_arh, n_cl, frac)
+            )
+            if frac >= ARH_FRACTION_THRESHOLD:
+                rewritten_csv = os.path.join(
+                    fb_dir, 'constraints_' + args.fallback_mode + '_arh.csv'
+                )
+                changed = maybe_insert_arh_in_constraints(
+                    constrains_path, rewritten_csv
+                )
+                if changed:
+                    print(
+                        'aRH >= {:.0%} of non-chromo clusters — '
+                        'inserting aRH between RH and INT in the non-chromovirus '
+                        "row's Domains order".format(ARH_FRACTION_THRESHOLD)
+                    )
+                    constrains_path = rewritten_csv
+                    print('using modified constraints table: ' + constrains_path)
+        elif args.fallback_mode == 'coarse3' and args.te_constrains is not None:
+            print('aRH check skipped: user supplied --te_constrains')
+
+    # split fasta file to chunks
+    fasta_file_split, matching_table = split_fasta_to_chunks(
+        args.reference_sequence, chunk_size=args.max_chunk_size
+        )
+    # recalculate gff3 coordinates
+    gff3_file_recalculated = recalculate_gff3_coordinates(gff3_input, matching_table)
+
+    fasta_seq_size = read_fasta_sequence_size(fasta_file_split)
+    total_size = sum(fasta_seq_size.values())
+    number_of_sequences = len(fasta_seq_size)
+    if total_size > args.max_chunk_size and number_of_sequences > 1:
+        print('running analysis on chunks of ~ {} bp'.format(args.max_chunk_size))
+        # sort dictionary by values
+        seq_id_size_sorted = [i[0] for i in sorted(
+            fasta_seq_size.items(), key=lambda x: int(x[1]), reverse=True
+            )]
+        number_of_temp_files = int(total_size / args.max_chunk_size) + 1
+        if number_of_temp_files > number_of_sequences:
+            number_of_temp_files = number_of_sequences
+
+        temp_files_fasta = make_temp_files(number_of_temp_files)
+        file_handles = [open(temp_file, 'w') for temp_file in temp_files_fasta]
+        # make dictionary seq_id_sorted as keys and values as file handles
+        seq_id_file_handle_dict = dict(zip(seq_id_size_sorted, cycle(file_handles)))
+
+        # write sequences to temporary files
+        with open(fasta_file_split, 'r') as f:
+            for line in f:
+                if line[0] == '>':
+                    header = line.strip().split(' ')[0][1:]
+                    seq_id_file_handle_dict[header].write(line)
+                else:
+                    seq_id_file_handle_dict[header].write(line)
+        os.remove(fasta_file_split)
+        # close file handles
+        for file_handle in file_handles:
+            file_handle.close()
+
+        # split gff3 file to temporary files -
+        # each temporary file will contain gff lines matching fasta
+        temp_files_gff = make_temp_files(number_of_temp_files)
+        file_handles = [open(temp_file, 'w') for temp_file in temp_files_gff]
+        # make dictionary seq_id_sorted as keys and values as file handles
+        seq_id_file_handle_dict = dict(zip(seq_id_size_sorted, cycle(file_handles)))
+        # write gff lines to chunks
+        with open(gff3_file_recalculated, 'r') as f:
+            for line in f:
+                if line[0] == '#':
+                    continue
+                else:
+                    header = line.strip().split('\t')[0]
+                    seq_id_file_handle_dict[header].write(line)
+        # close file handles
+        for file_handle in file_handles:
+            file_handle.close()
+        os.remove(gff3_file_recalculated)
+        # run retrotransposon detection on each temporary file
+        output_files = make_temp_files(number_of_temp_files)
+        print('number of chunks:": ' + str(number_of_temp_files))
+        for i in range(number_of_temp_files):
+            print('Running retrotransposon detection on file ' + str(i))
+            cmd = [f'{tool_path}/utils/detect_putative_ltr.R', '-s', temp_files_fasta[i],
+                 '-g',
+                 temp_files_gff[i], '-o', output_files[i], '-c', str(args.cpu), '-M',
+                 str(args.max_missing_domains), '-L', str(args.min_relative_length)]
+
+            if constrains_path:
+                cmd += ['--te_constrains', constrains_path]
+            if args.no_ambiguous_domains:
+                cmd += ['--no_ambiguous_domains']
+            subprocess.check_call(cmd)
+
+        #remove all temporary input files
+        for temp_file in temp_files_fasta + temp_files_gff:
+            os.remove(temp_file)
+
+        # concatenate output files
+        output_file_suffixes = ['_D.fasta', '_DL.fasta', '_DLT.fasta', '_DLTP.fasta',
+                                '_DLP.fasta', '.gff3', '_statistics.csv']
+
+        for suffix in output_file_suffixes:
+            if suffix == '_statistics.csv':
+                # sum up line with same word in first column
+                stat_files = [output_file + suffix for output_file in output_files]
+                new_statistics = sum_up_stats_files(stat_files)
+                with open(args.output + suffix, 'w') as f:
+                    f.write("\n".join(new_statistics))
+                # remove parsed temporary statistics files
+                for file in stat_files:
+                    os.remove(file)
+            elif suffix == '.gff3':
+                tmp_gff_unfiltered = tempfile.NamedTemporaryFile(delete=False).name
+                with open(tmp_gff_unfiltered, 'w') as f:
+                    for i in range(number_of_temp_files):
+                        tmp_gff = recalculate_gff3_back_to_original_coordinates(
+                            output_files[i] + suffix, matching_table
+                            )
+                        # remove temporary gff3 file
+                        os.remove(output_files[i] + suffix)
+                        with open(tmp_gff, 'r') as f_tmp:
+                            for line in f_tmp:
+                                f.write(line)
+                        os.remove(tmp_gff)
+                # filter overlapping features
+                good_id = get_unique_features(tmp_gff_unfiltered)
+                filter_gff3_file(
+                    tmp_gff_unfiltered, good_id, args.output + suffix
+                    )
+                # remove temporary gff3 file
+                os.remove(tmp_gff_unfiltered)
+            else:
+                with open(args.output + suffix, 'w') as f:
+                    for i in range(number_of_temp_files):
+                        # some file may not exist, so we need to check
+                        try:
+                            with open(output_files[i] + suffix, 'r') as g:
+                                for line in g:
+                                    f.write(line)
+                            # remove parsed temporary output files
+                            os.remove(output_files[i] + suffix)
+                        except FileNotFoundError:
+                            pass
+    else:
+        print('running analysis on whole input')
+        # no need to split sequences into chunks
+        cmd = [f'{tool_path}/utils/detect_putative_ltr.R', '-s', args.reference_sequence,
+             '-g',
+             gff3_input, '-o', args.output, '-c', str(args.cpu), '-M',
+             str(args.max_missing_domains), '-L', str(args.min_relative_length)]
+        if constrains_path:
+            cmd += ['--te_constrains', constrains_path]
+        if args.no_ambiguous_domains:
+            cmd += ['--no_ambiguous_domains']
+        subprocess.check_call(
+            cmd)
+
+    # add version of the output gff3 file - must go to the beginning of the file
+    add_version_to_gff3(args.output + '.gff3', __version__)
+    # Add graphical summary
+    cmd = [f'{tool_path}/dante_ltr_summary', '-g', args.output + '.gff3', '-o',
+           args.output + '_summary']
+    try:
+        # run cmd and capture output and error
+        subprocess.check_call(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+        print('Failed to run dante_ltr_summary')
+        pass
+    exit(0)
+
+
+if __name__ == '__main__':
+    # check version of python must be 3.6 or greater
+    if sys.version_info < (3, 6):
+        print('Python version must be 3.6 or greater')
+        sys.exit(1)
+    print("--------------------------------------------------------")
+    print("")
+    print("         ---|>>>>>---- DANTE_LTR ---->>>>>|---")
+    print("")
+    print("   Domain Based identification of LTR retrotransposons")
+    print("")
+    print("--------------------------------------------------------")
+    main()
