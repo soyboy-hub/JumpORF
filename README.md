@@ -23,5 +23,5 @@ cd JumpORF/testing
 #get TAIR10.1 Arabidopsis thaliana genome
 wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/735/GCF_000001735.4_TAIR10.1/GCF_000001735.4_TAIR10.1_genomic.fna.gz
 gunzip GCF_000001735.4_TAIR10.1_genomic.fna.gz
-docker run -v $(pwd):/home jump_orf JumpORF GCF_000001735.4_TAIR10.1_genomic.fna ./out_testing arabidopsis arabidopsis 50 arabidopsis 0.8 5 0.5 yes
+docker run -v $(pwd):/home jump_orf JumpORF GCF_000001735.4_TAIR10.1_genomic.fna ./out_testing arabidopsis arabidopsis 50 arabidopsis 0.8 5 0.5 no
 ```
