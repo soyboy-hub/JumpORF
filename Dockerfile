@@ -31,6 +31,10 @@ WORKDIR /
 COPY ./module /module
 COPY ./hmm /hmm
 COPY ./JumpORF.py /usr/local/bin/JumpORF
+COPY ./dante_ltr /dante_ltr
+RUN find /dante_ltr \
+  \( -path "/dante_ltr/databases" -o -path "*/__pycache__" \) -prune \
+  -o -type f -exec chmod +x {} \;
 RUN chmod +x /usr/local/bin/JumpORF
 RUN chmod +x /module/run_LTR_RTE_detection.py
 RUN chmod +x /module/run_DNA_TE_detection.py
