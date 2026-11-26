@@ -837,7 +837,7 @@ def extract_transcripts_from_gff3(outpath, tmp, prefix, genome_):
             out_f.write(f'>{gene_id}\n{transcript_seq}\n')
         
 def run_trans_decoder(tmp, prefix):
-    os.system(f'/module/TransDecoder/TransDecoder.LongOrfs -t {tmp}/{prefix}.aORF.transcripts.fasta -m 100 -S --complete_orfs_only --output_dir {tmp}')
+    os.system(f'/module/TransDecoder/TransDecoder.LongOrfs -t {tmp}/{prefix}.aORF.transcripts.fasta -m 100 -S --complete_orfs_only --output_dir {tmp} > /dev/null 2>&1')
     with open(f'{tmp}/{prefix}.aORF.transcripts.tmp.faa', 'w') as new:
         for seq in SeqIO.parse(f'{tmp}/{prefix}.aORF.transcripts.fasta.transdecoder_dir/longest_orfs.pep', 'fasta'):
             if '.p1' in seq.id:
