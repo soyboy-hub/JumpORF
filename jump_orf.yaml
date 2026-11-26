@@ -1,0 +1,20 @@
+name: dante
+channels:
+  - bioconda
+  - conda-forge
+  - petrnovak
+dependencies:
+  - dante=0.2.10
+  - dante_ltr=0.6.5.0
+  - tesorter=1.4.7
+  - biopython=1.81
+  - numpy=1.24.2
+  - python=3.11.0
+  - blast=2.12.0
+  - bedtools>=2.23.0
+  - mmseqs2>=14
+  - biopython=1.81
+  - mafft>=7.490
+
+  
+
