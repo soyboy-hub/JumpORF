@@ -303,11 +303,15 @@ def main() -> None:
         run_module(
             "run_aORF_detection.py",
             [
-                *common_arguments,
+                args.genome,
                 args.species,
                 args.min_identity_to_cluster,
                 args.min_size_cluster,
                 args.min_coverage,
+                args.processors,
+                outdir,
+                args.prefix,
+                outdir_tmp,
             ],
         )
 
